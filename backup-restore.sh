@@ -2,18 +2,28 @@
 
 set -e
 
-INSTALL_DIR="/opt/rw-backup-restore"
+# --- Static Configuration ---
+# The script is now hardcoded for the Remnawave Shop installation.
+REMNALABS_ROOT_DIR="/opt/remnawave/shop"
+DOCKER_CONTAINER_DB="remnawave-telegram-shop-db"
+DOCKER_VOLUME_DB="remnawave-telegram-shop-db-data"
+DOCKER_APP_CONTAINER="bot" # Main application container for the shop version check
+
+# --- Installation and Script Variables ---
+INSTALL_DIR="/opt/rw-shop-backup-restore"
 BACKUP_DIR="$INSTALL_DIR/backup"
 CONFIG_FILE="$INSTALL_DIR/config.env"
 SCRIPT_NAME="backup-restore.sh"
 SCRIPT_PATH="$INSTALL_DIR/$SCRIPT_NAME"
 RETAIN_BACKUPS_DAYS=7
-SYMLINK_PATH="/usr/local/bin/rw-backup"
-REMNALABS_ROOT_DIR=""
+SYMLINK_PATH="/usr/local/bin/rw-shop-backup"
 ENV_NODE_FILE=".env-node"
 ENV_FILE=".env"
-SCRIPT_REPO_URL="https://raw.githubusercontent.com/distillium/remnawave-backup-restore/main/backup-restore.sh"
+SCRIPT_REPO_URL="https://raw.githubusercontent.com/legiz-ru/remnawave-backup-restore/main/backup-restore.sh"
 SCRIPT_RUN_PATH="$(realpath "$0")"
+VERSION="1.2.0" # Shop-specific version
+
+# --- User-configurable Variables (from config.env) ---
 GD_CLIENT_ID=""
 GD_CLIENT_SECRET=""
 GD_REFRESH_TOKEN=""
@@ -21,7 +31,10 @@ GD_FOLDER_ID=""
 UPLOAD_METHOD="telegram"
 CRON_TIMES=""
 TG_MESSAGE_THREAD_ID=""
-VERSION="1.0.2e"
+BOT_TOKEN=""
+CHAT_ID=""
+DB_USER=""
+
 
 if [[ -t 0 ]]; then
     RED=$'\e[31m'
@@ -143,7 +156,6 @@ load_or_create_config() {
         UPLOAD_METHOD=${UPLOAD_METHOD:-telegram}
         DB_USER=${DB_USER:-postgres}
         CRON_TIMES=${CRON_TIMES:-}
-        REMNALABS_ROOT_DIR=${REMNALABS_ROOT_DIR:-}
         TG_MESSAGE_THREAD_ID=${TG_MESSAGE_THREAD_ID:-}
         
         local config_updated=false
@@ -166,29 +178,12 @@ load_or_create_config() {
             config_updated=true
         fi
 
-        [[ -z "$DB_USER" ]] && read -rp "    Введите имя пользователя PostgreSQL (по умолчанию postgres): " DB_USER
-        DB_USER=${DB_USER:-postgres}
-        config_updated=true
-        echo ""
-        
-        if [[ -z "$REMNALABS_ROOT_DIR" ]]; then
-            print_message "ACTION" "Где установлена/устанавливается ваша панель Remnawave?"
-            echo "    1. /opt/remnawave"
-            echo "    2. /root/remnawave"
-            echo ""
-            local remnawave_path_choice
-            while true; do
-                read -rp "    ${GREEN}[?]${RESET} Выберите вариант (1 или 2): " remnawave_path_choice
-                case "$remnawave_path_choice" in
-                    1) REMNALABS_ROOT_DIR="/opt/remnawave"; break ;;
-                    2) REMNALABS_ROOT_DIR="/root/remnawave"; break ;;
-                    *) print_message "ERROR" "Неверный ввод. Пожалуйста, выберите 1 или 2." ;;
-                esac
-            done
-            config_updated=true
-            echo ""
+        if [[ -z "$DB_USER" ]]; then
+          read -rp "    Введите имя пользователя PostgreSQL (по умолчанию postgres): " DB_USER
+          DB_USER=${DB_USER:-postgres}
+          config_updated=true
         fi
-
+        echo ""
 
         if [[ "$UPLOAD_METHOD" == "google_drive" ]]; then
             if [[ -z "$GD_CLIENT_ID" || -z "$GD_CLIENT_SECRET" || -z "$GD_REFRESH_TOKEN" ]]; then
@@ -278,6 +273,7 @@ load_or_create_config() {
             fi
         else
             print_message "INFO" "Конфигурация не найдена, создаем новую..."
+            print_message "INFO" "Скрипт будет работать с директорией: ${BOLD}${REMNALABS_ROOT_DIR}${RESET}"
             echo ""
             print_message "INFO" "Создайте Telegram бота в ${CYAN}@BotFather${RESET} и получите API Token"
             read -rp "    Введите API Token: " BOT_TOKEN
@@ -292,21 +288,6 @@ load_or_create_config() {
             echo ""
             read -rp "    Введите имя пользователя PostgreSQL (по умолчанию postgres): " DB_USER
             DB_USER=${DB_USER:-postgres}
-            echo ""
-
-            print_message "ACTION" "Где установлена/устанавливается ваша панель Remnawave?"
-            echo "    1. /opt/remnawave"
-            echo "    2. /root/remnawave"
-            echo ""
-            local remnawave_path_choice
-            while true; do
-                read -rp "    ${GREEN}[?]${RESET} Выберите вариант (1 или 2): " remnawave_path_choice
-                case "$remnawave_path_choice" in
-                    1) REMNALABS_ROOT_DIR="/opt/remnawave"; break ;;
-                    2) REMNALABS_ROOT_DIR="/root/remnawave"; break ;;
-                    *) print_message "ERROR" "Неверный ввод. Пожалуйста, выберите 1 или 2." ;;
-                esac
-            done
             echo ""
 
             mkdir -p "$INSTALL_DIR" || { print_message "ERROR" "Не удалось создать каталог установки ${BOLD}${INSTALL_DIR}${RESET}. Проверьте права доступа."; exit 1; }
@@ -343,8 +324,8 @@ escape_markdown_v2() {
 
 get_remnawave_version() {
     local version_output
-    version_output=$(docker exec remnawave sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' package.json
- 2>/dev/null)
+    # Use DOCKER_APP_CONTAINER which is set based on the installation path
+    version_output=$(docker exec "$DOCKER_APP_CONTAINER" sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' package.json 2>/dev/null)
     if [[ -z "$version_output" ]]; then
         echo "не определена"
     else
@@ -497,21 +478,21 @@ send_google_drive_document() {
 }
 
 create_backup() {
-    print_message "INFO" "Начинаю процесс создания резервной копии..."
+    print_message "INFO" "Начинаю процесс создания резервной копии для ${BOLD}${REMNALABS_ROOT_DIR}${RESET}..."
     echo ""
 
     REMNAWAVE_VERSION=$(get_remnawave_version)
     TIMESTAMP=$(date +%Y-%m-%d"_"%H_%M_%S)
     BACKUP_FILE_DB="dump_${TIMESTAMP}.sql.gz"
-    BACKUP_FILE_FINAL="remnawave_backup_${TIMESTAMP}.tar.gz"
+    BACKUP_FILE_FINAL="remnawave_shop_backup_${TIMESTAMP}.tar.gz"
     ENV_NODE_PATH="$REMNALABS_ROOT_DIR/$ENV_NODE_FILE"
     ENV_PATH="$REMNALABS_ROOT_DIR/$ENV_FILE"
 
     mkdir -p "$BACKUP_DIR" || { echo -e "${RED}❌ Ошибка: Не удалось создать каталог для бэкапов. Проверьте права доступа.${RESET}"; send_telegram_message "❌ Ошибка: Не удалось создать каталог бэкапов ${BOLD}$BACKUP_DIR${RESET}." "None"; exit 1; }
 
-    if ! docker inspect remnawave-db > /dev/null 2>&1 || ! docker container inspect -f '{{.State.Running}}' remnawave-db 2>/dev/null | grep -q "true"; then
-        echo -e "${RED}❌ Ошибка: Контейнер ${BOLD}'remnawave-db'${RESET} не найден или не запущен. Невозможно создать бэкап базы данных.${RESET}"
-        local error_msg="❌ Ошибка: Контейнер ${BOLD}'remnawave-db'${RESET} не найден или не запущен. Не удалось создать бэкап."
+    if ! docker inspect "$DOCKER_CONTAINER_DB" > /dev/null 2>&1 || ! docker container inspect -f '{{.State.Running}}' "$DOCKER_CONTAINER_DB" 2>/dev/null | grep -q "true"; then
+        echo -e "${RED}❌ Ошибка: Контейнер ${BOLD}'$DOCKER_CONTAINER_DB'${RESET} не найден или не запущен. Невозможно создать бэкап базы данных.${RESET}"
+        local error_msg="❌ Ошибка: Контейнер ${BOLD}'$DOCKER_CONTAINER_DB'${RESET} не найден или не запущен. Не удалось создать бэкап."
         if [[ "$UPLOAD_METHOD" == "telegram" ]]; then
             send_telegram_message "$error_msg" "None"
         elif [[ "$UPLOAD_METHOD" == "google_drive" ]]; then
@@ -520,7 +501,7 @@ create_backup() {
         exit 1
     fi
     print_message "INFO" "Создание PostgreSQL дампа и сжатие в файл..."
-    if ! docker exec -t "remnawave-db" pg_dumpall -c -U "$DB_USER" | gzip -9 > "$BACKUP_DIR/$BACKUP_FILE_DB"; then
+    if ! docker exec -t "$DOCKER_CONTAINER_DB" pg_dumpall -c -U "$DB_USER" | gzip -9 > "$BACKUP_DIR/$BACKUP_FILE_DB"; then
         STATUS=$?
         echo -e "${RED}❌ Ошибка при создании дампа PostgreSQL. Код выхода: ${BOLD}$STATUS${RESET}. Проверьте имя пользователя БД и доступ к контейнеру.${RESET}"
         local error_msg="❌ Ошибка при создании дампа PostgreSQL. Код выхода: ${BOLD}${STATUS}${RESET}"
@@ -587,7 +568,7 @@ create_backup() {
 
     print_message "INFO" "Отправка бэкапа (${UPLOAD_METHOD})..."
     local DATE=$(date +'%Y-%m-%d %H:%M:%S')
-    local caption_text=$'💾 #backup_success\n➖➖➖➖➖➖➖➖➖\n✅ *Бэкап успешно создан*\n🌊 *Remnawave:* '"${REMNAWAVE_VERSION}"$'\n📅 *Дата:* '"${DATE}"
+    local caption_text=$'💾 #backup_success\n➖➖➖➖➖➖➖➖➖\n✅ *Бэкап Shop успешно создан*\n🌊 *Версия:* '"${REMNAWAVE_VERSION}"$'\n📅 *Дата:* '"${DATE}"
 
     if [[ -f "$BACKUP_DIR/$BACKUP_FILE_FINAL" ]]; then
         if [[ "$UPLOAD_METHOD" == "telegram" ]]; then
@@ -599,7 +580,7 @@ create_backup() {
         elif [[ "$UPLOAD_METHOD" == "google_drive" ]]; then
             if send_google_drive_document "$BACKUP_DIR/$BACKUP_FILE_FINAL"; then
                 print_message "SUCCESS" "Бэкап успешно отправлен в Google Drive."
-                local tg_success_message=$'💾 #backup_success\n➖➖➖➖➖➖➖➖➖\n✅ *Бэкап успешно создан и отправлен в Google Drive*\n🌊 *Remnawave:* '"${REMNAWAVE_VERSION}"$'\n📅 *Дата:* '"${DATE}"
+                local tg_success_message=$'💾 #backup_success\n➖➖➖➖➖➖➖➖➖\n✅ *Бэкап Shop успешно создан и отправлен в Google Drive*\n🌊 *Версия:* '"${REMNAWAVE_VERSION}"$'\n📅 *Дата:* '"${DATE}"
                 if send_telegram_message "$tg_success_message"; then
                     print_message "SUCCESS" "Уведомление об успешной отправке на Google Drive отправлено в Telegram."
                 else
@@ -626,7 +607,7 @@ create_backup() {
     echo ""
 
     print_message "INFO" "Применение политики хранения бэкапов (оставляем за последние ${BOLD}${RETAIN_BACKUPS_DAYS}${RESET} дней)..."
-    find "$BACKUP_DIR" -maxdepth 1 -name "remnawave_backup_*.tar.gz" -mtime +$RETAIN_BACKUPS_DAYS -delete
+    find "$BACKUP_DIR" -maxdepth 1 -name "remnawave_shop_backup_*.tar.gz" -mtime +$RETAIN_BACKUPS_DAYS -delete
     print_message "SUCCESS" "Политика хранения применена. Старые бэкапы удалены."
     echo ""
 }
@@ -739,7 +720,7 @@ setup_auto_send() {
                 mv "$temp_crontab_file.tmp" "$temp_crontab_file"
 
                 for time_entry_local in "${cron_times_to_write[@]}"; do
-                    echo "$time_entry_local * * * $SCRIPT_PATH backup >> /var/log/rw_backup_cron.log 2>&1" >> "$temp_crontab_file"
+                    echo "$time_entry_local * * * $SCRIPT_PATH backup >> /var/log/rw_shop_backup_cron.log 2>&1" >> "$temp_crontab_file"
                 done
                 
                 if crontab "$temp_crontab_file"; then
@@ -775,19 +756,19 @@ restore_backup() {
     clear
     echo "${GREEN}${BOLD}Восстановление из бэкапа${RESET}"
     echo ""
-    print_message "WARN" "Восстановление полностью перезапишет базу данных ${BOLD}Remnawave${RESET}"
+    print_message "WARN" "Восстановление полностью перезапишет базу данных для установки в ${BOLD}${REMNALABS_ROOT_DIR}${RESET}"
     echo -e "Поместите файл бэкапа (${BOLD}*.tar.gz${RESET}) в папку: ${BOLD}${BACKUP_DIR}${RESET}"
 
     ENV_NODE_RESTORE_PATH="$REMNALABS_ROOT_DIR/$ENV_NODE_FILE"
     ENV_RESTORE_PATH="$REMNALABS_ROOT_DIR/$ENV_FILE"
 
-    if ! compgen -G "$BACKUP_DIR/remnawave_backup_*.tar.gz" > /dev/null; then
+    if ! compgen -G "$BACKUP_DIR/remnawave_shop_backup_*.tar.gz" > /dev/null; then
         print_message "ERROR" "Ошибка: Не найдено файлов бэкапов в ${BOLD}${BACKUP_DIR}${RESET}. Пожалуйста, поместите файл бэкапа в этот каталог."
         read -rp "Нажмите Enter для продолжения..."
         return
     fi
 
-    readarray -t SORTED_BACKUP_FILES < <(find "$BACKUP_DIR" -maxdepth 1 -name "remnawave_backup_*.tar.gz" -printf "%T@ %p\n" | sort -nr | cut -d' ' -f2-)
+    readarray -t SORTED_BACKUP_FILES < <(find "$BACKUP_DIR" -maxdepth 1 -name "remnawave_shop_backup_*.tar.gz" -printf "%T@ %p\n" | sort -nr | cut -d' ' -f2-)
 
     if [ ${#SORTED_BACKUP_FILES[@]} -eq 0 ]; then
         print_message "ERROR" "Ошибка: Не найдено файлов бэкапов в ${BOLD}${BACKUP_DIR}${RESET}."
@@ -795,7 +776,7 @@ restore_backup() {
         return
     fi
 
-        echo ""
+    echo ""
     echo "Выберите файл для восстановления:"
     local i=1
     for file in "${SORTED_BACKUP_FILES[@]}"; do
@@ -855,31 +836,31 @@ restore_backup() {
         print_message "WARN" "Предупреждение: Не удалось корректно остановить сервисы. Возможно, они уже остановлены."
     }
 
-    if docker volume ls -q | grep -q "remnawave-db-data"; then
-        if ! docker volume rm remnawave-db-data; then
-            echo -e "${RED}❌ Критическая ошибка: Не удалось удалить том ${BOLD}'remnawave-db-data'${RESET}. Восстановление невозможно. Проверьте права или занятость тома.${RESET}"
+    if docker volume ls -q | grep -q "$DOCKER_VOLUME_DB"; then
+        if ! docker volume rm "$DOCKER_VOLUME_DB"; then
+            echo -e "${RED}❌ Критическая ошибка: Не удалось удалить том ${BOLD}'$DOCKER_VOLUME_DB'${RESET}. Восстановление невозможно. Проверьте права или занятость тома.${RESET}"
             return
         fi
-        print_message "SUCCESS" "Том ${BOLD}remnawave-db-data${RESET} успешно удален."
+        print_message "SUCCESS" "Том ${BOLD}$DOCKER_VOLUME_DB${RESET} успешно удален."
     else
-        print_message "INFO" "Том ${BOLD}remnawave-db-data${RESET} не найден, пропуск удаления."
+        print_message "INFO" "Том ${BOLD}$DOCKER_VOLUME_DB${RESET} не найден, пропуск удаления."
     fi
     echo ""
 
-    print_message "INFO" "Запуск контейнера ${BOLD}remnawave-db${RESET} для инициализации..."
-    if ! docker compose up -d remnawave-db; then
-        echo -e "${RED}❌ Критическая ошибка: Не удалось запустить контейнер ${BOLD}'remnawave-db'${RESET}. Восстановление невозможно.${RESET}"
+    print_message "INFO" "Запуск контейнера ${BOLD}db${RESET} для инициализации..."
+    if ! docker compose up -d db; then
+        echo -e "${RED}❌ Критическая ошибка: Не удалось запустить сервис ${BOLD}'db'${RESET}. Восстановление невозможно.${RESET}"
         return
     fi
-    print_message "INFO" "Ожидание запуска контейнера ${BOLD}remnawave-db${RESET}..."
+    print_message "INFO" "Ожидание запуска контейнера ${BOLD}$DOCKER_CONTAINER_DB${RESET}..."
     sleep 10
     echo ""
 
-    if ! docker container inspect -f '{{.State.Running}}' remnawave-db 2>/dev/null | grep -q "true"; then
-        echo -e "${RED}❌ Критическая ошибка: Контейнер ${BOLD}'remnawave-db'${RESET} все еще не запущен после попытки старта. Восстановление невозможно.${RESET}"
+    if ! docker container inspect -f '{{.State.Running}}' "$DOCKER_CONTAINER_DB" 2>/dev/null | grep -q "true"; then
+        echo -e "${RED}❌ Критическая ошибка: Контейнер ${BOLD}'$DOCKER_CONTAINER_DB'${RESET} все еще не запущен после попытки старта. Восстановление невозможно.${RESET}"
         return
     fi
-    print_message "SUCCESS" "Контейнер ${BOLD}remnawave-db${RESET} успешно запущен."
+    print_message "SUCCESS" "Контейнер ${BOLD}$DOCKER_CONTAINER_DB${RESET} успешно запущен."
     echo ""
 
     clear
@@ -896,12 +877,12 @@ restore_backup() {
         return
     fi
 
-    if ! docker exec -i remnawave-db psql -U "$DB_USER" -d postgres -c "SELECT 1;" > /dev/null 2>&1; then
-        echo -e "${RED}❌ Ошибка: Не удалось подключиться к базе данных ${BOLD}'postgres'${RESET} в контейнере ${BOLD}'remnawave-db'${RESET} с пользователем '${BOLD}${DB_USER}${RESET}'.${RESET}"
+    if ! docker exec -i "$DOCKER_CONTAINER_DB" psql -U "$DB_USER" -d postgres -c "SELECT 1;" > /dev/null 2>&1; then
+        echo -e "${RED}❌ Ошибка: Не удалось подключиться к базе данных ${BOLD}'postgres'${RESET} в контейнере ${BOLD}'$DOCKER_CONTAINER_DB'${RESET} с пользователем '${BOLD}${DB_USER}${RESET}'.${RESET}"
         echo "  Проверьте имя пользователя БД в ${BOLD}${CONFIG_FILE}${RESET} и доступность контейнера."
         return
     fi
-    print_message "SUCCESS" "Успешное подключение к базе данных ${BOLD}postgres${RESET} в контейнере ${BOLD}remnawave-db${RESET}."
+    print_message "SUCCESS" "Успешное подключение к базе данных ${BOLD}postgres${RESET} в контейнере ${BOLD}$DOCKER_CONTAINER_DB${RESET}."
     echo ""
 
 
@@ -975,15 +956,15 @@ restore_backup() {
         exit 1
     fi
 
-    local RESTORE_LOG_FILE="/var/log/rw-restore.log"
+    local RESTORE_LOG_FILE="/var/log/rw_shop-restore.log"
 
     print_message "INFO" "Восстановление базы данных из файла: ${BOLD}${SQL_FILE}${RESET}..."
     
     : > "$RESTORE_LOG_FILE"
 
-    if cat "$SQL_FILE" | docker exec -i "remnawave-db" psql -q -U "$DB_USER" > /dev/null 2>>"$RESTORE_LOG_FILE"; then
+    if cat "$SQL_FILE" | docker exec -i "$DOCKER_CONTAINER_DB" psql -q -U "$DB_USER" > /dev/null 2>>"$RESTORE_LOG_FILE"; then
         print_message "SUCCESS" "Импорт базы данных успешно завершен."
-        local restore_success_prefix="✅ Восстановление Remnawave DB успешно завершено из файла: "
+        local restore_success_prefix="✅ Восстановление Remnawave Shop DB успешно завершено из файла: "
         local restored_filename="${SELECTED_BACKUP##*/}"
         if [[ "$UPLOAD_METHOD" == "telegram" ]]; then send_telegram_message "${restore_success_prefix}${restored_filename}"; fi
     else
@@ -998,7 +979,7 @@ restore_backup() {
             print_message "ERROR" "Ошибка при импорте базы данных. Код выхода: ${BOLD}$STATUS${RESET}. Деталей ошибки нет в логе ${BOLD}$RESTORE_LOG_FILE${RESET}."
         fi
         
-        local restore_error_prefix="❌ Ошибка при импорте Remnawave DB из файла: "
+        local restore_error_prefix="❌ Ошибка при импорте Remnawave Shop DB из файла: "
         local restored_filename_error="${SELECTED_BACKUP##*/}"
         local error_suffix=". Код выхода: ${BOLD}${STATUS}${RESET}."
         
@@ -1020,7 +1001,7 @@ restore_backup() {
     print_message "SUCCESS" "Временные файлы восстановления успешно удалены."
     echo ""
 
-    print_message "INFO" "Перезапуск всех сервисов ${BOLD}Remnawave${RESET} и вывод логов..."
+    print_message "INFO" "Перезапуск всех сервисов в ${BOLD}${REMNALABS_ROOT_DIR}${RESET} и вывод логов..."
     if ! docker compose down; then
         print_message "WARN" "Предупреждение: Не удалось остановить сервисы Docker Compose перед полным запуском. Возможно, некоторые уже остановлены."
     fi
@@ -1029,7 +1010,7 @@ restore_backup() {
         echo -e "${RED}❌ Критическая ошибка: Не удалось запустить все сервисы Docker Compose после восстановления. Проверьте файлы compose.${RESET}"
         return
     else
-        print_message "SUCCESS" "Все сервисы ${BOLD}Remnawave${RESET} успешно запущены."
+        print_message "SUCCESS" "Все сервисы успешно запущены."
     fi
     echo ""
     read -rp "Нажмите Enter для продолжения..."
@@ -1326,7 +1307,6 @@ configure_settings() {
         echo "   1. Настройки Telegram"
         echo "   2. Настройки Google Drive"
         echo "   3. Имя пользователя PostgreSQL"
-        echo "   4. Путь Remnawave"
         echo ""
         echo "   0. Вернуться в главное меню"
         echo ""
@@ -1407,7 +1387,7 @@ configure_settings() {
                     case $gd_choice in
                         1)
                             echo "Если у вас нет Client ID и Client Secret токенов"
-                            local guide_url="https://telegra.ph/Nastrojka-Google-API-06-02"
+                            local guide_url="https://telegra.ph/Nastrojка-Google-API-06-02"
                             print_message "LINK" "Изучите этот гайд: ${CYAN}${guide_url}${RESET}"
                             read -rp "   Введите новый Google Client ID: " NEW_GD_CLIENT_ID
                             GD_CLIENT_ID="$NEW_GD_CLIENT_ID"
@@ -1486,30 +1466,6 @@ configure_settings() {
                 echo ""
                 read -rp "Нажмите Enter для продолжения..."
                 ;;
-            4)
-                clear
-                echo -e "${GREEN}${BOLD}Путь Remnawave${RESET}"
-                echo ""
-                print_message "INFO" "Текущий путь Remnawave: ${BOLD}${REMNALABS_ROOT_DIR}${RESET}"
-                echo ""
-                print_message "ACTION" "Выберите новый путь для панели Remnawave:"
-                echo "   1. /opt/remnawave"
-                echo "   2. /root/remnawave"
-                echo ""
-                local new_remnawave_path_choice
-                while true; do
-                    read -rp "   ${GREEN}[?]${RESET} Выберите вариант (1 или 2): " new_remnawave_path_choice
-                    case "$new_remnawave_path_choice" in
-                        1) REMNALABS_ROOT_DIR="/opt/remnawave"; break ;;
-                        2) REMNALABS_ROOT_DIR="/root/remnawave"; break ;;
-                        *) print_message "ERROR" "Неверный ввод. Пожалуйста, выберите 1 или 2." ;;
-                    esac
-                done
-                save_config
-                print_message "SUCCESS" "Путь Remnawave успешно обновлен на ${BOLD}${REMNALABS_ROOT_DIR}${RESET}."
-                echo ""
-                read -rp "Нажмите Enter для продолжения..."
-                ;;
             0) break ;;
             *) print_message "ERROR" "Неверный ввод. Пожалуйста, выберите один из предложенных пунктов." ;;
         esac
@@ -1520,8 +1476,9 @@ configure_settings() {
 main_menu() {
     while true; do
         clear
-        echo -e "${GREEN}${BOLD}REMNAWAVE BACKUP & RESTORE by distillium${RESET} "
+        echo -e "${GREEN}${BOLD}REMNAWAVE SHOP BACKUP & RESTORE by legiz-ru${RESET} "
         echo -e "${BOLD}${LIGHT_GRAY}Версия: ${VERSION}${RESET}"
+        echo -e "${BOLD}${GRAY}Путь: ${REMNALABS_ROOT_DIR}${RESET}"
         echo ""
         echo "   1. Создание бэкапа вручную"
         echo "   2. Восстановление из бэкапа"
@@ -1534,7 +1491,7 @@ main_menu() {
         echo "   7. Удаление скрипта"
         echo ""
         echo "   0. Выход"
-        echo -e "   —  Быстрый запуск: ${BOLD}${GREEN}rw-backup${RESET} доступен из любой точки системы"
+        echo -e "   —  Быстрый запуск: ${BOLD}${GREEN}rw-shop-backup${RESET} доступен из любой точки системы"
         echo ""
 
         read -rp "${GREEN}[?]${RESET} Выберите пункт: " choice
@@ -1583,6 +1540,7 @@ elif [[ "$1" == "restore" ]]; then
 elif [[ "$1" == "update" ]]; then
     update_script
 elif [[ "$1" == "remove" ]]; then
+    load_or_create_config
     remove_script
 else
     echo -e "${RED}❌ Неверное использование. Доступные команды: ${BOLD}${0} [backup|restore|update|remove]${RESET}${RESET}"
